@@ -241,6 +241,7 @@
   .progress-log .ok { color: var(--green); }
   .progress-log .err { color: var(--red); }
   .progress-log .wait { color: var(--gold); }
+  .progress-log .warn { color: #f97316; }
 
   /* 結果テーブル */
   .result-section { display: none; }
@@ -474,7 +475,7 @@
 
   <div class="legal-note">
     <strong>【評価方法】</strong>財産評価基本通達第169条に基づき、①課税時期の最終価格、②課税時期の属する月の毎日の最終価格の月平均額、③前月の月平均額、④前々月の月平均額、の4価格のうち<strong>最も低いもの</strong>を採用します。<br>
-    <strong>【株価データ出所】</strong>stooq.com のAPIを経由して取得しています。申告書添付には証券会社発行の評価額証明書または国税庁公表データとの照合を推奨します。<br>
+    <strong>【株価データ出所】</strong>stooq.com のデータを allorigins.win / corsproxy.io / codetabs.com 経由で取得しています（自動フォールバック）。申告書添付には証券会社発行の評価額証明書または国税庁公表データとの照合を推奨します。<br>
     <strong>【免責】</strong>本ツールは参考計算用です。実際の申告にあたっては必ず原資料を確認してください。
   </div>
 
@@ -528,7 +529,31 @@ function log(msg, cls='') {
   el.scrollTop = el.scrollHeight;
 }
 
-// ── stooq.com経由で株価取得（日本株対応・CORS制限なし）──
+// ── stooq.com経由で株価取得（複数CORSプロキシフォールバック）──
+function parseCsvToDateMap(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return null;
+  const dateMap = {};
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(',');
+    if (cols.length < 5) continue;
+    const date = cols[0].trim();   // YYYY-MM-DD
+    const close = parseFloat(cols[4]);
+    if (!isNaN(close) && close > 0) dateMap[date] = close;
+  }
+  return Object.keys(dateMap).length > 0 ? dateMap : null;
+}
+
+async function fetchWithTimeout(url, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchStockData(code, deathDate) {
   const ticker = `${code}.jp`;  // stooq 日本株フォーマット
 
@@ -538,27 +563,47 @@ async function fetchStockData(code, deathDate) {
 
   const fmtDate = d => d.toISOString().slice(0,10).replace(/-/g,'');
   const stooqUrl = `https://stooq.com/q/d/l/?s=${ticker}&d1=${fmtDate(from)}&d2=${fmtDate(to)}&i=d`;
-  const url = `https://corsproxy.io/?${encodeURIComponent(stooqUrl)}`;
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const text = await res.text();
+  // 複数プロキシを順番に試みる
+  const proxies = [
+    {
+      name: 'allorigins.win',
+      buildUrl: () => `https://api.allorigins.win/get?url=${encodeURIComponent(stooqUrl)}`,
+      extract: async (res) => {
+        const json = await res.json();
+        if (!json || !json.contents) throw new Error('allorigins: contentsなし');
+        return json.contents;
+      }
+    },
+    {
+      name: 'corsproxy.io',
+      buildUrl: () => `https://corsproxy.io/?${encodeURIComponent(stooqUrl)}`,
+      extract: async (res) => res.text()
+    },
+    {
+      name: 'codetabs.com',
+      buildUrl: () => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(stooqUrl)}`,
+      extract: async (res) => res.text()
+    }
+  ];
 
-  // CSV形式: Date,Open,High,Low,Close,Volume
-  const lines = text.trim().split('\n');
-  if (lines.length < 2) throw new Error('データなし');
-
-  const dateMap = {};
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(',');
-    if (cols.length < 5) continue;
-    const date = cols[0].trim();   // YYYY-MM-DD
-    const close = parseFloat(cols[4]);
-    if (!isNaN(close) && close > 0) dateMap[date] = close;
+  let lastError;
+  for (const proxy of proxies) {
+    try {
+      log(`  → ${proxy.name} 経由で取得試行中...`, 'wait');
+      const res = await fetchWithTimeout(proxy.buildUrl());
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await proxy.extract(res);
+      const dateMap = parseCsvToDateMap(text);
+      if (!dateMap) throw new Error('株価データなし（証券コードをご確認ください）');
+      log(`  ✓ ${proxy.name} 経由で取得成功`, 'ok');
+      return dateMap;
+    } catch (e) {
+      log(`  ✗ ${proxy.name} 失敗: ${e.message}`, 'warn');
+      lastError = e;
+    }
   }
-
-  if (Object.keys(dateMap).length === 0) throw new Error('株価データなし（証券コードをご確認ください）');
-  return dateMap;
+  throw new Error(`全プロキシ失敗。最後のエラー: ${lastError.message}`);
 }
 
 // 指定日（土日考慮）の終値
