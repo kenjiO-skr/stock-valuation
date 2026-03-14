@@ -474,7 +474,7 @@
 
   <div class="legal-note">
     <strong>【評価方法】</strong>財産評価基本通達第169条に基づき、①課税時期の最終価格、②課税時期の属する月の毎日の最終価格の月平均額、③前月の月平均額、④前々月の月平均額、の4価格のうち<strong>最も低いもの</strong>を採用します。<br>
-    <strong>【株価データ出所】</strong>Yahoo Finance（finance.yahoo.com）のAPIを経由して取得しています。申告書添付には証券会社発行の評価額証明書または国税庁公表データとの照合を推奨します。<br>
+    <strong>【株価データ出所】</strong>stooq.com のAPIを経由して取得しています。申告書添付には証券会社発行の評価額証明書または国税庁公表データとの照合を推奨します。<br>
     <strong>【免責】</strong>本ツールは参考計算用です。実際の申告にあたっては必ず原資料を確認してください。
   </div>
 
@@ -528,47 +528,36 @@ function log(msg, cls='') {
   el.scrollTop = el.scrollHeight;
 }
 
-// ── Yahoo Finance proxy経由で株価取得 ──
+// ── stooq.com経由で株価取得（日本株対応・CORS制限なし）──
 async function fetchStockData(code, deathDate) {
-  // Yahoo Finance Japan ticker format: e.g. 7203.T
-  const ticker = `${code}.T`;
+  const ticker = `${code}.jp`;  // stooq 日本株フォーマット
 
-  // 相続開始日の前後90日分取得
   const dt = new Date(deathDate);
   const from = new Date(dt); from.setDate(from.getDate() - 100);
   const to   = new Date(dt); to.setDate(to.getDate() + 5);
 
-  const fromTs = Math.floor(from.getTime() / 1000);
-  const toTs   = Math.floor(to.getTime() / 1000);
+  const fmtDate = d => d.toISOString().slice(0,10).replace(/-/g,'');
+  const stooqUrl = `https://stooq.com/q/d/l/?s=${ticker}&d1=${fmtDate(from)}&d2=${fmtDate(to)}&i=d`;
+  const url = `https://corsproxy.io/?${encodeURIComponent(stooqUrl)}`;
 
-  // CORS proxy経由でYahoo Finance v8 APIを叩く
-  const url = `https://corsproxy.io/?https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&period1=${fromTs}&period2=${toTs}`;
-
-  const res = await fetch(url, {
-    headers: { 'Accept': 'application/json' }
-  });
+  const res = await fetch(url);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
+  const text = await res.text();
 
-  const result = json?.chart?.result?.[0];
-  if (!result) throw new Error('データなし');
+  // CSV形式: Date,Open,High,Low,Close,Volume
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) throw new Error('データなし');
 
-  const timestamps = result.timestamp;
-  const closes = result.indicators?.adjclose?.[0]?.adjclose
-              || result.indicators?.quote?.[0]?.close;
-
-  if (!timestamps || !closes) throw new Error('株価データなし');
-
-  // timestamp→日付マップ
   const dateMap = {};
-  for (let i = 0; i < timestamps.length; i++) {
-    const d = new Date(timestamps[i] * 1000);
-    // JST補正
-    const jst = new Date(d.getTime() + 9 * 3600 * 1000);
-    const key = jst.toISOString().slice(0,10);
-    if (closes[i] != null) dateMap[key] = closes[i];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = lines[i].split(',');
+    if (cols.length < 5) continue;
+    const date = cols[0].trim();   // YYYY-MM-DD
+    const close = parseFloat(cols[4]);
+    if (!isNaN(close) && close > 0) dateMap[date] = close;
   }
 
+  if (Object.keys(dateMap).length === 0) throw new Error('株価データなし（証券コードをご確認ください）');
   return dateMap;
 }
 
@@ -666,7 +655,7 @@ async function calculate() {
       const tr = document.createElement('tr');
       const cells = [p1, p2, p3, p4];
       tr.innerHTML = `
-        <td>${displayName}<span class="code">${s.code}.T</span></td>
+        <td>${displayName}<span class="code">${s.code}.jp</span></td>
         <td>${s.shares ? s.shares.toLocaleString() : '—'}</td>
         ${cells.map((p, i) => `<td class="${i===minIdx ? 'td-min' : ''}">${fmt(p)}</td>`).join('')}
         <td class="td-min">${fmt(minPrice)}</td>
@@ -683,7 +672,7 @@ async function calculate() {
       tr.innerHTML = `
         <td>${s.name || s.code}<span class="code">${s.code}.T</span></td>
         <td>${s.shares || '—'}</td>
-        <td colspan="6" class="td-error">⚠ データ取得失敗（${e.message}）— 証券コードをご確認ください</td>
+        <td colspan="6" class="td-error">⚠ データ取得失敗（${e.message}）</td>
       `;
       tbody.appendChild(tr);
     }
